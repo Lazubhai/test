@@ -1,0 +1,182 @@
+
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ConversationHandler, ContextTypes
+)
+from database import DatabaseHandler
+from config import config
+
+logging.basicConfig(level=logging.INFO)
+
+SELECT_HABIT, LOG_ROUTINES, ASK_REWARD, ASK_CRAVE_POINTS = range(4)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        db = DatabaseHandler(update.effective_user.id)
+        await update.message.reply_text(
+            f"Hello, {db.sha_username}! Welcome to the Smart Habit Analyzer Bot.\nUse /log to log a habit."
+        )
+        db.close_connections()
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
+
+async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        db = DatabaseHandler(update.effective_user.id)
+        habits = db.get_habits()
+        db.close_connections()
+
+        if not habits:
+            await update.message.reply_text("No habits found to log.")
+            return ConversationHandler.END
+
+        keyboard = [[InlineKeyboardButton(habit[1], callback_data=str(habit[0]))] for habit in habits]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Select a habit to log:", reply_markup=reply_markup)
+        return SELECT_HABIT
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
+        return ConversationHandler.END
+
+async def select_habit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    habit_id = int(query.data)
+    context.user_data['habit_id'] = habit_id
+
+    db = DatabaseHandler(update.effective_user.id)
+    routines = db.get_routines_for_habit(habit_id)
+    cue = db.get_habit_cue(habit_id)
+    db.close_connections()
+
+    context.user_data['routines'] = routines
+    context.user_data['routine_index'] = 0
+    context.user_data['routine_statuses'] = []
+    context.user_data['cue'] = cue
+
+    if routines:
+        current_routine = routines[0]
+        keyboard = [[InlineKeyboardButton("Yes", callback_data='1'), InlineKeyboardButton("No", callback_data='0')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            f"Did you complete this routine: *{current_routine[1]}*?", reply_markup=reply_markup, parse_mode="Markdown"
+        )
+        return LOG_ROUTINES
+    else:
+        return await ask_reward(query.message, context)
+
+async def log_routines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['routine_statuses'].append(int(query.data))
+    context.user_data['routine_index'] += 1
+
+    index = context.user_data['routine_index']
+    routines = context.user_data['routines']
+
+    if index < len(routines):
+        current_routine = routines[index]
+        keyboard = [[InlineKeyboardButton("Yes", callback_data='1'), InlineKeyboardButton("No", callback_data='0')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            f"Did you complete this routine: *{current_routine[1]}*?", reply_markup=reply_markup, parse_mode="Markdown"
+        )
+        return LOG_ROUTINES
+    else:
+        return await ask_reward(query.message, context)
+
+async def ask_reward(message, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Yes", callback_data='yes'), InlineKeyboardButton("No", callback_data='no')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await message.reply_text("Did you take a reward after completing this habit?", reply_markup=reply_markup)
+    return ASK_REWARD
+
+async def handle_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+
+    if choice == "yes":
+        context.user_data['reward_status'] = 1
+        await query.message.reply_text("On a scale of 1 to 10, how satisfying was your reward? Send a number.")
+        return ASK_CRAVE_POINTS
+    elif choice == "no":
+        context.user_data['reward_status'] = 0
+        context.user_data['crave_points'] = 0
+        return await save_log(query.message, context)
+    else:
+        await query.message.reply_text("Please choose Yes or No.")
+        return ASK_REWARD
+
+async def handle_crave_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rating = int(update.message.text)
+        if not (1 <= rating <= 10):
+            raise ValueError
+        context.user_data['crave_points'] = rating
+        return await save_log(update.message, context)
+    except:
+        await update.message.reply_text("Please enter a valid number between 1 and 10.")
+        return ASK_CRAVE_POINTS
+
+async def save_log(message, context: ContextTypes.DEFAULT_TYPE):
+    habit_id = context.user_data['habit_id']
+    routine_statuses = context.user_data['routine_statuses']
+    routines = context.user_data['routines']
+    reward_status = context.user_data.get('reward_status', 0)
+    crave_points = context.user_data.get('crave_points', 0)
+
+    db = DatabaseHandler(message.from_user.id)
+    log_id = db.insert_habit_log(habit_id, 1, reward_status, crave_points)
+    for i in range(len(routines)):
+        db.insert_routine_log(log_id, routines[i][0], routine_statuses[i])
+    db.close_connections()
+
+    reply = f"Habit logged successfully!\n"
+    if reward_status:
+        reply += f"Reward taken with satisfaction rating {crave_points}.\n"
+    else:
+        reply += "No reward taken.\n"
+    reply += "Great job keeping up the habit!"
+    await message.reply_text(reply, reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        db = DatabaseHandler(update.effective_user.id)
+        await update.message.reply_text(f"I didn't understand that, {db.sha_username}. Use /log to begin logging.")
+        db.close_connections()
+    except:
+        await update.message.reply_text("I didn’t understand that. Use /start or /log to begin.")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Logging cancelled.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+def main():
+    app = ApplicationBuilder().token(config['bot_token']).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("log", log_command)],
+        states={
+            SELECT_HABIT: [CallbackQueryHandler(select_habit)],
+            LOG_ROUTINES: [CallbackQueryHandler(log_routines)],
+            ASK_REWARD: [CallbackQueryHandler(handle_reward)],
+            ASK_CRAVE_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_crave_points)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
+
+    print("Bot is running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
